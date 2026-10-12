@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+seen_tests.json
+test_registry.json
+auto_update_chats.json
+*.html
