@@ -21,7 +21,7 @@ from string import Template
 import telebot  # PIP se 'pyTelegramBotAPI' install hona chahiye
 
 # --- TELEGRAM CONFIGURATION ---
-BOT_TOKEN = "8914012210:AAE6MdpHK8q3_FPFFzVeUBI4288RxeVPQs8"
+BOT_TOKEN = "8983424094:AAGJEzc1V7sPUNQuM8EJwShDJugtI4AszQM"
 try:
     telebot.apihelper.CONNECT_TIMEOUT = 15
     telebot.apihelper.READ_TIMEOUT = 120
