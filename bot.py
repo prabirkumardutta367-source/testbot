@@ -65,7 +65,7 @@ def now_ist():
 
 
 # ============================================================
-# HEADERS + PAYLOAD HELPERS
+# HEADERS + PAYLOAD
 # ============================================================
 def build_headers(ua="Dart/3.7 (dart:io)"):
     return {
@@ -93,18 +93,11 @@ def build_payload(user=None, label=None, se="fl", sch="t_la", cond=None, extra=N
 
 
 # ============================================================
-# AUTO-DISCOVERY
+# GLOBAL CACHE
 # ============================================================
-STRATEGIES = [
-    ("Dart3.7+old", "Dart/3.7 (dart:io)", "MhiG6fJRQO5ASHKSBYRh8U0JhqC4y9", "1624097755607_BCKL"),
-    ("Dart3.9+old", "Dart/3.9 (dart:io)", "MhiG6fJRQO5ASHKSBYRh8U0JhqC4y9", "1624097755607_BCKL"),
-    ("Dart3.10+old", "Dart/3.10 (dart:io)", "MhiG6fJRQO5ASHKSBYRh8U0JhqC4y9", "1624097755607_BCKL"),
-    ("Dart3.7+none", "Dart/3.7 (dart:io)", None, None),
-    ("Dart3.9+none", "Dart/3.9 (dart:io)", None, None),
-    ("okhttp", "okhttp/4.9.0", None, None),
-    ("dio", "Dio/5.4.0", None, None),
-]
-
+all_tests_cache = []
+TEST_CATEGORY_CACHE = {}
+IMAGE_DATA_CACHE = {}
 WORKING_STRATEGY = None
 WORKING_HEADERS = None
 
@@ -112,7 +105,7 @@ WORKING_HEADERS = None
 # USER SESSIONS (Login System)
 # ============================================================
 USER_SESSIONS_FILE = os.path.join(DATA_DIR, "user_sessions.json")
-user_states = {}  # {chat_id: "awaiting_id" | {"step": "awaiting_pass", "user": "..."}}
+user_states = {}
 
 
 def load_sessions():
@@ -134,6 +127,18 @@ def save_sessions(sessions):
 
 
 USER_SESSIONS = load_sessions()
+
+
+# ============================================================
+# AUTO-DISCOVERY
+# ============================================================
+STRATEGIES = [
+    ("Dart3.7+old", "Dart/3.7 (dart:io)", "MhiG6fJRQO5ASHKSBYRh8U0JhqC4y9", "1624097755607_BCKL"),
+    ("Dart3.9+old", "Dart/3.9 (dart:io)", "MhiG6fJRQO5ASHKSBYRh8U0JhqC4y9", "1624097755607_BCKL"),
+    ("Dart3.10+old", "Dart/3.10 (dart:io)", "MhiG6fJRQO5ASHKSBYRh8U0JhqC4y9", "1624097755607_BCKL"),
+    ("Dart3.7+none", "Dart/3.7 (dart:io)", None, None),
+    ("Dart3.9+none", "Dart/3.9 (dart:io)", None, None),
+]
 
 
 def try_strategy(strat):
@@ -165,7 +170,7 @@ def discover_working_strategy():
             print(f"✅ Strategy: {s[0]}")
             print("=" * 60)
             return True
-    print("❌ No strategy worked")
+    print("⚠️ No global strategy — login system use karega")
     print("=" * 60)
     return False
 
@@ -180,11 +185,6 @@ def safe_post(endpoint, data, timeout=(30, 180)):
 # ============================================================
 # IMAGE HANDLING
 # ============================================================
-IMAGE_DATA_CACHE = {}
-TEST_CATEGORY_CACHE = {}
-all_tests_cache = []
-
-
 def _looks_like_image_url(value):
     if not isinstance(value, str):
         return False
@@ -296,11 +296,11 @@ def embed_question_images(raw_obj, q_text):
     for u in candidates:
         data = _download_image_as_data_uri(u)
         if data:
-            tags.append('<img src="' + data + '" alt="Question Image">')
+            tags.append('<img src="' + data + '" alt="Q Img">')
 
     def rep(m):
         data = _download_image_as_data_uri(m.group(1))
-        return '<img src="' + data + '" alt="Question Image">' if data else m.group(0)
+        return '<img src="' + data + '" alt="Q Img">' if data else m.group(0)
 
     q_text = re.sub(r'<img[^>]+(?:src|data-src)=["\']([^"\']+)["\'][^>]*>', rep, str(q_text), flags=re.I)
     if tags:
@@ -379,7 +379,7 @@ function startTimer(){if(tstarted)return;tstarted=true;tstart=Date.now();setInte
 
 
 # ============================================================
-# CATEGORY
+# CATEGORY HELPERS
 # ============================================================
 def _normalise_category(value):
     value = str(value or "UNCATEGORIZED").strip()
@@ -508,7 +508,7 @@ def download_single_test(test_id, fallback_name, chat_id=None):
         resp = res.json()
         main = resp[0] if isinstance(resp, list) and resp else resp
         if not isinstance(main, dict):
-            return None, f"Bad response"
+            return None, "Bad response"
 
         test_json = main.get("json", {}) if isinstance(main.get("json"), dict) else {}
         test_name = test_json.get("_ex_na", fallback_name)
@@ -661,23 +661,31 @@ def send_test(chat_id, tid, tname):
 
 
 # ============================================================
-# LOGIN SYSTEM
+# LOGIN
 # ============================================================
 def try_login_tnc(username, password):
     patterns = [
         {"fn": "common_fn", "se": "login", "data": {"json": "*"}, "user": username, "pass": password},
         {"fn": "common_fn", "se": "lg", "data": {"json": "*"}, "user": username, "pass": password},
         {"fn": "common_fn", "se": "signin", "data": {"json": "*"}, "user": username, "pass": password},
-        {"fn": "common_fn", "se": "login", "data": {"json": "*"}, "email": username, "password": password},
+        {"fn": "common_fn", "se": "auth", "data": {"json": "*"}, "user": username, "pass": password},
         {"fn": "common_fn", "se": "login", "data": {"json": "*"}, "mobile": username, "password": password},
+        {"fn": "common_fn", "se": "login", "data": {"json": "*"}, "email": username, "password": password},
+        {"fn": "login", "data": {"json": "*"}, "user": username, "pass": password},
+        {"fn": "auth", "se": "login", "data": {"json": "*"}, "user": username, "pass": password},
     ]
+    last_err = "No endpoint responded"
     for i, payload in enumerate(patterns):
         try:
             r = HTTP_SESSION.post(URL, headers=build_headers(), data={"payload": json.dumps(payload)}, timeout=20)
             print(f"[LOGIN {i}] HTTP {r.status_code}: {r.text[:200]}")
             if r.status_code != 200:
+                last_err = f"HTTP {r.status_code}"
                 continue
-            data = r.json()
+            try:
+                data = r.json()
+            except Exception:
+                continue
             if isinstance(data, list) and data:
                 data = data[0]
             if isinstance(data, dict):
@@ -694,11 +702,12 @@ def try_login_tnc(username, password):
                     return True, found, ""
                 for ef in ("error", "message", "msg", "err"):
                     if ef in data:
-                        return False, None, str(data[ef])
+                        last_err = str(data[ef])
         except Exception as e:
             print(f"[LOGIN ERR {i}] {e}")
+            last_err = str(e)
             continue
-    return False, None, "Login API endpoint unknown"
+    return False, None, last_err
 
 
 @bot.message_handler(commands=['login'])
@@ -740,7 +749,7 @@ def cmd_whoami(message):
 
 
 # ============================================================
-# COMMANDS
+# DEBUG + FINDLOGIN
 # ============================================================
 @bot.message_handler(commands=['debug'])
 def cmd_debug(message):
@@ -749,12 +758,52 @@ def cmd_debug(message):
     lines.append(f"Tests cached: {len(all_tests_cache)}")
     sess = USER_SESSIONS.get(str(message.chat.id))
     if sess:
-        lines.append(f"Logged in as: `{sess.get('user')}`")
+        lines.append(f"Logged: ✅ `{sess.get('user')}`")
     else:
-        lines.append("Login: ❌ Not logged in")
+        lines.append("Logged: ❌")
     bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
 
 
+@bot.message_handler(commands=['findlogin'])
+def cmd_findlogin(message):
+    """Login endpoint discovery — multiple patterns."""
+    results = ["🔍 **Login Discovery**\n"]
+    patterns = [
+        ("common_fn", "login", {"user": "test", "pass": "test"}),
+        ("common_fn", "lg", {"user": "test", "pass": "test"}),
+        ("common_fn", "signin", {"user": "test", "pass": "test"}),
+        ("common_fn", "auth", {"user": "test", "pass": "test"}),
+        ("common_fn", "login", {"mobile": "test", "password": "test"}),
+        ("common_fn", "login", {"email": "test", "password": "test"}),
+        ("login", "", {"user": "test", "pass": "test"}),
+        ("auth", "login", {"user": "test", "pass": "test"}),
+        ("user", "login", {"user": "test", "pass": "test"}),
+        ("common_fn", "lgn", {"user": "test", "pass": "test"}),
+        ("common_fn", "sign_in", {"user": "test", "pass": "test"}),
+    ]
+    for fn, se, extra in patterns:
+        try:
+            p = {"fn": fn, "data": {"json": "*"}}
+            if se:
+                p["se"] = se
+            p.update(extra)
+            r = HTTP_SESSION.post(URL, headers=build_headers(), data={"payload": json.dumps(p)}, timeout=15)
+            body = r.text[:120].replace("\n", " ")
+            results.append(f"`{fn}/{se}` → {r.status_code}\n`{body}`\n")
+        except Exception as e:
+            results.append(f"`{fn}/{se}` → ERR {type(e).__name__}\n")
+
+    msg = "\n".join(results)
+    for i in range(0, len(msg), 3500):
+        try:
+            bot.send_message(message.chat.id, f"```\n{msg[i:i+3500]}\n```", parse_mode="Markdown")
+        except Exception:
+            bot.send_message(message.chat.id, msg[i:i+3500])
+
+
+# ============================================================
+# MAIN COMMANDS
+# ============================================================
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(message):
     global all_tests_cache
@@ -765,20 +814,16 @@ def cmd_start(message):
         bot.send_message(chat_id,
             "🤖 **Welcome!**\n\n"
             "Pehle login karo:\n👉 `/login`\n\n"
-            "Phir `/start` chalao tests dekhne ke liye.",
+            "Login endpoint pata nahi? `/findlogin` chalao.",
             parse_mode="Markdown")
         return
-
-    if WORKING_STRATEGY is None:
-        bot.reply_to(message, "⏳ Loading API...")
-        discover_working_strategy()
 
     bot.reply_to(message, "⏳ Loading tests...")
     all_tests_cache = get_all_test_ids(chat_id=chat_id)
 
     if not all_tests_cache:
         bot.send_message(chat_id,
-            "❌ 0 tests mile. /debug chalao ya /logout karke dobara /login karo.",
+            "❌ 0 tests. `/debug` chalao ya `/logout` → `/login` dobara.",
             parse_mode="Markdown")
         return
 
@@ -787,11 +832,11 @@ def cmd_start(message):
         f"User: `{sess.get('user')}`\n"
         f"Total: **{len(all_tests_cache)} Tests**\n\n"
         f"**Commands:**\n"
-        f"/download <no> — Test download\n"
-        f"/downloadall — Sab download\n"
-        f"/categories — Category list\n"
-        f"/debug — Status\n"
-        f"/logout — Logout",
+        f"/download <no>\n"
+        f"/downloadall\n"
+        f"/categories\n"
+        f"/debug\n"
+        f"/logout",
         parse_mode="Markdown")
 
 
@@ -809,7 +854,7 @@ def cmd_cats(message):
         groups.setdefault(c, []).append((tid, name))
     lines = ["📚 **CATEGORIES**\n"]
     for c, t in sorted(groups.items()):
-        lines.append(f"🏷️ **{c}** — {len(t)} test(s)")
+        lines.append(f"🏷️ **{c}** — {len(t)}")
     bot.send_message(message.chat.id, "\n".join(lines), parse_mode="Markdown")
 
 
@@ -861,7 +906,7 @@ def cmd_dl(message):
 
 
 # ============================================================
-# LOGIN STATE HANDLER (BOTTOM)
+# LOGIN STATE HANDLER (BOTTOM — MUST BE LAST)
 # ============================================================
 @bot.message_handler(
     func=lambda m: user_states.get(m.chat.id) is not None
@@ -934,7 +979,17 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[⚠️] Webhook: {e}")
 
-    discover_working_strategy()
+    try:
+        discover_working_strategy()
+    except Exception as e:
+        print(f"[⚠️] Discovery failed: {e}")
 
-    print("[💡] Telegram pe /login bhejo")
-    bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
+    print("[💡] Telegram pe /login ya /findlogin bhejo")
+
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
+        except Exception as e:
+            print(f"[⚠️] Polling error: {e}")
+            print("[⏳] 15 second me retry...")
+            time.sleep(15)
