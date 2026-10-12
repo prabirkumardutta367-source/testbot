@@ -5,8 +5,6 @@ import json
 import os
 import re
 import time
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import html as htmlmod
 import base64
 from urllib.parse import urljoin
@@ -52,29 +50,24 @@ HTTP_SESSION.mount("http://", HTTPAdapter(max_retries=_retry, pool_connections=1
 URL = "https://crm.tncnursing.in/common/"
 
 # ============================================================
-# AUTO-DISCOVERY: multiple strategies try karo
+# TIMEZONE
 # ============================================================
-STRATEGIES = [
-    # (name, user_agent, user, label, extra_headers)
-    ("Dart3.7+old-token", "Dart/3.7 (dart:io)", "MhiG6fJRQO5ASHKSBYRh8U0JhqC4y9", "1624097755607_BCKL", {}),
-    ("Dart3.9+old-token", "Dart/3.9 (dart:io)", "MhiG6fJRQO5ASHKSBYRh8U0JhqC4y9", "1624097755607_BCKL", {}),
-    ("Dart3.10+old-token", "Dart/3.10 (dart:io)", "MhiG6fJRQO5ASHKSBYRh8U0JhqC4y9", "1624097755607_BCKL", {}),
-    ("Dart3.7+no-token", "Dart/3.7 (dart:io)", None, None, {}),
-    ("Dart3.9+no-token", "Dart/3.9 (dart:io)", None, None, {}),
-    ("Dart3.10+no-token", "Dart/3.10 (dart:io)", None, None, {}),
-    ("Dart3.7+empty", "Dart/3.7 (dart:io)", "", "", {}),
-    ("okhttp", "okhttp/4.9.0", None, None, {}),
-    ("browser", "Mozilla/5.0 (Linux; Android 10)", None, None, {}),
-    ("dio", "Dio/5.4.0", None, None, {}),
-    ("flutter", "Flutter/3.19.0", None, None, {}),
-]
-
-# Ye globally store hoga ki kaunsa strategy kaam kar rahi hai
-WORKING_STRATEGY = None
-WORKING_HEADERS = None
+try:
+    IST = ZoneInfo("Asia/Kolkata") if ZoneInfo is not None else None
+except Exception:
+    IST = None
+if IST is None:
+    IST = timezone(timedelta(hours=5, minutes=30), name="Asia/Kolkata")
 
 
-def build_headers(ua):
+def now_ist():
+    return datetime.now(IST)
+
+
+# ============================================================
+# HEADERS + PAYLOAD HELPERS
+# ============================================================
+def build_headers(ua="Dart/3.7 (dart:io)"):
     return {
         "user-agent": ua,
         "content-type": "application/x-www-form-urlencoded",
@@ -99,86 +92,99 @@ def build_payload(user=None, label=None, se="fl", sch="t_la", cond=None, extra=N
     return p
 
 
-def try_strategy(strategy):
-    """Returns True if this strategy works (HTTP 200 with valid data)."""
-    name, ua, user, label, extra = strategy
+# ============================================================
+# AUTO-DISCOVERY
+# ============================================================
+STRATEGIES = [
+    ("Dart3.7+old", "Dart/3.7 (dart:io)", "MhiG6fJRQO5ASHKSBYRh8U0JhqC4y9", "1624097755607_BCKL"),
+    ("Dart3.9+old", "Dart/3.9 (dart:io)", "MhiG6fJRQO5ASHKSBYRh8U0JhqC4y9", "1624097755607_BCKL"),
+    ("Dart3.10+old", "Dart/3.10 (dart:io)", "MhiG6fJRQO5ASHKSBYRh8U0JhqC4y9", "1624097755607_BCKL"),
+    ("Dart3.7+none", "Dart/3.7 (dart:io)", None, None),
+    ("Dart3.9+none", "Dart/3.9 (dart:io)", None, None),
+    ("okhttp", "okhttp/4.9.0", None, None),
+    ("dio", "Dio/5.4.0", None, None),
+]
+
+WORKING_STRATEGY = None
+WORKING_HEADERS = None
+
+# ============================================================
+# USER SESSIONS (Login System)
+# ============================================================
+USER_SESSIONS_FILE = os.path.join(DATA_DIR, "user_sessions.json")
+user_states = {}  # {chat_id: "awaiting_id" | {"step": "awaiting_pass", "user": "..."}}
+
+
+def load_sessions():
+    try:
+        if os.path.exists(USER_SESSIONS_FILE):
+            with open(USER_SESSIONS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def save_sessions(sessions):
+    try:
+        with open(USER_SESSIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(sessions, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+USER_SESSIONS = load_sessions()
+
+
+def try_strategy(strat):
+    name, ua, user, label = strat
     try:
         h = build_headers(ua)
-        h.update(extra)
         payload = build_payload(user=user, label=label)
         r = HTTP_SESSION.post(URL, headers=h, data={"payload": json.dumps(payload)}, timeout=20)
         print(f"[TRY] {name}: HTTP {r.status_code} | {r.text[:80]}")
         if r.status_code == 200:
-            try:
-                data = r.json()
-                # Check karo ki valid data hai
-                if isinstance(data, list) and len(data) > 0:
-                    return True, h, user, label
-                if isinstance(data, dict) and len(data) > 0:
-                    return True, h, user, label
-            except Exception:
-                pass
+            data = r.json()
+            if (isinstance(data, list) and data) or (isinstance(data, dict) and data):
+                return True, h, user, label
         return False, None, None, None
     except Exception as e:
-        print(f"[TRY] {name}: FAIL {type(e).__name__}: {e}")
+        print(f"[TRY] {name}: FAIL {e}")
         return False, None, None, None
 
 
 def discover_working_strategy():
-    """Sabhi strategies try karo, pehli jo kaam kare woh lock karo."""
     global WORKING_STRATEGY, WORKING_HEADERS
     print("=" * 60)
-    print("[🔎] Auto-discovering working API strategy...")
-    print("=" * 60)
-    for strat in STRATEGIES:
-        ok, h, user, label = try_strategy(strat)
+    print("[🔎] Discovering API strategy...")
+    for s in STRATEGIES:
+        ok, h, u, l = try_strategy(s)
         if ok:
-            WORKING_STRATEGY = {"name": strat[0], "user": user, "label": label, "ua": strat[1]}
+            WORKING_STRATEGY = {"name": s[0], "user": u, "label": l, "ua": s[1]}
             WORKING_HEADERS = h
-            print(f"✅ [SUCCESS] Using strategy: {strat[0]}")
+            print(f"✅ Strategy: {s[0]}")
             print("=" * 60)
             return True
-    print("❌ [FAIL] Koi bhi strategy kaam nahi kar rahi!")
-    print("   Matlab - TNC ne API completely change kar diya hai.")
+    print("❌ No strategy worked")
     print("=" * 60)
     return False
 
 
 def safe_post(endpoint, data, timeout=(30, 180)):
-    """Working strategy ke saath POST karo."""
-    if WORKING_HEADERS is None:
-        # Fallback - original headers
-        h = build_headers("Dart/3.7 (dart:io)")
-    else:
-        h = WORKING_HEADERS
+    h = WORKING_HEADERS if WORKING_HEADERS else build_headers()
     r = HTTP_SESSION.post(endpoint, headers=h, data=data, timeout=timeout)
     r.raise_for_status()
     return r
 
 
 # ============================================================
-# GLOBAL CACHE
+# IMAGE HANDLING
 # ============================================================
-all_tests_cache = []
-TEST_CATEGORY_CACHE = {}
-TEST_DURATION_CACHE = {}
 IMAGE_DATA_CACHE = {}
-
-try:
-    IST = ZoneInfo("Asia/Kolkata") if ZoneInfo is not None else None
-except (ZoneInfoNotFoundError, Exception):
-    IST = None
-if IST is None:
-    IST = timezone(timedelta(hours=5, minutes=30), name="Asia/Kolkata")
+TEST_CATEGORY_CACHE = {}
+all_tests_cache = []
 
 
-def now_ist():
-    return datetime.now(IST)
-
-
-# ============================================================
-# IMAGE EXTRACTION (same as before)
-# ============================================================
 def _looks_like_image_url(value):
     if not isinstance(value, str):
         return False
@@ -213,12 +219,10 @@ def _download_image_as_data_uri(image_url):
             return image_url
         if image_url in IMAGE_DATA_CACHE:
             return IMAGE_DATA_CACHE[image_url]
-        ih = {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36",
-            "Accept": "image/*,*/*;q=0.8",
-            "Referer": "https://crm.tncnursing.in/"
-        }
-        r = HTTP_SESSION.get(image_url, headers=ih, timeout=(20, 90), stream=True, allow_redirects=True)
+        ih = {"User-Agent": "Mozilla/5.0 (Linux; Android 10)",
+              "Accept": "image/*,*/*;q=0.8",
+              "Referer": "https://crm.tncnursing.in/"}
+        r = HTTP_SESSION.get(image_url, headers=ih, timeout=(20, 90), stream=True)
         r.raise_for_status()
         ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         raw = bytearray()
@@ -227,9 +231,7 @@ def _download_image_as_data_uri(image_url):
                 raw.extend(chunk)
                 if len(raw) > 12 * 1024 * 1024:
                     return None
-        if not raw:
-            return None
-        if not ctype.startswith("image/"):
+        if not raw or not ctype.startswith("image/"):
             return None
         try:
             from PIL import Image
@@ -258,14 +260,14 @@ def _download_image_as_data_uri(image_url):
 
 def _extract_image_candidates(obj, key_hint=""):
     out = []
-    image_key_words = ("image", "img", "photo", "picture", "media", "attachment",
-                       "thumbnail", "questionimage", "question_image", "file")
+    kw = ("image", "img", "photo", "picture", "media", "attachment",
+          "thumbnail", "questionimage", "question_image", "file")
 
     def add(v):
         if not isinstance(v, str):
             return
         v = htmlmod.unescape(v).replace("\\/", "/").strip()
-        if _looks_like_image_url(v) or any(x in key_hint.lower() for x in image_key_words):
+        if _looks_like_image_url(v) or any(x in key_hint.lower() for x in kw):
             u = _normalise_image_url(v)
             if u and u not in out:
                 out.append(u)
@@ -294,14 +296,13 @@ def embed_question_images(raw_obj, q_text):
     for u in candidates:
         data = _download_image_as_data_uri(u)
         if data:
-            tags.append('<img src="' + data + '" alt="Question Image" loading="eager">')
+            tags.append('<img src="' + data + '" alt="Question Image">')
 
-    def replace_img(m):
+    def rep(m):
         data = _download_image_as_data_uri(m.group(1))
-        return '<img src="' + data + '" alt="Question Image" loading="eager">' if data else m.group(0)
+        return '<img src="' + data + '" alt="Question Image">' if data else m.group(0)
 
-    q_text = re.sub(r'<img[^>]+(?:src|data-src)=["\']([^"\']+)["\'][^>]*>',
-                    replace_img, str(q_text), flags=re.I)
+    q_text = re.sub(r'<img[^>]+(?:src|data-src)=["\']([^"\']+)["\'][^>]*>', rep, str(q_text), flags=re.I)
     if tags:
         q_text += '<div class="question-images">' + ''.join(tags) + '</div>'
     return q_text
@@ -332,6 +333,7 @@ body{font-family:Inter,system-ui,Arial;background:#F7F9FC;margin:0;padding:16px;
 .timer{font-weight:800;color:#ef4444;font-size:18px;text-align:right}
 .review-box{background:#F5F3FF;border:1px solid #DDD6FE;color:#4C1D95;padding:14px;border-radius:10px;margin-top:10px;font-weight:600;line-height:1.7}
 .modebtn{padding:12px;border:1px solid #E5EAF0;background:#fff;border-radius:10px;cursor:pointer;font-weight:800;margin-right:8px;margin-top:8px}
+.q-text img,.option img{max-width:100%;height:auto;border-radius:8px;display:block;margin:8px auto}
 </style></head><body>
 <div class="card"><div style="font-weight:800;font-size:18px">${TITLE}</div>
 <div style="margin-top:6px">Batch: ${BATCH_NAME}</div>
@@ -411,36 +413,41 @@ def get_test_category(test_id):
 # ============================================================
 # GET ALL TESTS
 # ============================================================
-def get_all_test_ids():
+def get_all_test_ids(chat_id=None):
     global TEST_CATEGORY_CACHE
-    if WORKING_STRATEGY is None:
-        print("[ERROR] No working strategy - API unreachable")
+
+    user = label = None
+    if chat_id:
+        sess = USER_SESSIONS.get(str(chat_id))
+        if sess:
+            user = sess.get("user")
+            label = sess.get("label", "")
+
+    if not user and WORKING_STRATEGY:
+        user = WORKING_STRATEGY.get("user")
+        label = WORKING_STRATEGY.get("label")
+
+    if not user:
         return []
-    payload = build_payload(
-        user=WORKING_STRATEGY.get("user"),
-        label=WORKING_STRATEGY.get("label")
-    )
+
+    payload = build_payload(user=user, label=label)
     try:
         res = safe_post(URL, data={"payload": json.dumps(payload)}, timeout=(30, 180))
-        master_list = res.json()
-
-        if isinstance(master_list, dict):
+        master = res.json()
+        if isinstance(master, dict):
             for k in ('data', 'result', 'response', 'list'):
-                if k in master_list and isinstance(master_list[k], list):
-                    master_list = master_list[k]
+                if k in master and isinstance(master[k], list):
+                    master = master[k]
                     break
             else:
-                print(f"[ERROR] Dict response keys: {list(master_list.keys())}")
                 return []
-
-        if not isinstance(master_list, list) or len(master_list) == 0:
-            print(f"[ERROR] master_list empty or not list")
+        if not isinstance(master, list) or not master:
             return []
 
         extracted = []
         TEST_CATEGORY_CACHE = {}
 
-        for course in master_list:
+        for course in master:
             if not isinstance(course, dict):
                 continue
             cd = course.get("json", {})
@@ -461,31 +468,37 @@ def get_all_test_ids():
                         TEST_CATEGORY_CACHE[str(tid)] = cat
                         extracted.append((tid, name))
 
-        # Dedupe
         seen = set()
         unique = []
         for tid, name in extracted:
             if tid not in seen:
                 seen.add(tid)
                 unique.append((tid, name))
-        print(f"[DEBUG] Extracted {len(unique)} unique tests")
         return unique
     except Exception as e:
-        import traceback
-        print(f"[FATAL] get_all_test_ids: {e}")
-        traceback.print_exc()
+        print(f"[ERR] get_all: {e}")
         return []
 
 
 # ============================================================
 # DOWNLOAD SINGLE TEST
 # ============================================================
-def download_single_test(test_id, fallback_name):
-    if WORKING_STRATEGY is None:
-        return None, "No working API strategy"
+def download_single_test(test_id, fallback_name, chat_id=None):
+    user = label = None
+    if chat_id:
+        sess = USER_SESSIONS.get(str(chat_id))
+        if sess:
+            user = sess.get("user")
+            label = sess.get("label", "")
+    if not user and WORKING_STRATEGY:
+        user = WORKING_STRATEGY.get("user")
+        label = WORKING_STRATEGY.get("label")
+
+    if not user:
+        return None, "Login required. /login chalao."
+
     payload = build_payload(
-        user=WORKING_STRATEGY.get("user"),
-        label=WORKING_STRATEGY.get("label"),
+        user=user, label=label,
         se="la_ex", sch=None,
         cond=[test_id],
         extra={"freeExams": [test_id], "paidExams": []}
@@ -495,7 +508,7 @@ def download_single_test(test_id, fallback_name):
         resp = res.json()
         main = resp[0] if isinstance(resp, list) and resp else resp
         if not isinstance(main, dict):
-            return None, f"Bad response: {type(main)}"
+            return None, f"Bad response"
 
         test_json = main.get("json", {}) if isinstance(main.get("json"), dict) else {}
         test_name = test_json.get("_ex_na", fallback_name)
@@ -513,17 +526,14 @@ def download_single_test(test_id, fallback_name):
         if not q_ids:
             return None, "No questions in layout"
 
-        # Fetch questions
         q_payload = build_payload(
-            user=WORKING_STRATEGY.get("user"),
-            label=WORKING_STRATEGY.get("label"),
-            se="fe", sch="t_qu",
+            user=user, label=label, se="fe", sch="t_qu",
             cond={"(row_id)": q_ids}
         )
         r_q = safe_post(URL, data={"payload": json.dumps(q_payload)}, timeout=(30, 180))
         raw_q = r_q.json()
         if not isinstance(raw_q, list):
-            return None, f"Questions not list: {type(raw_q)}"
+            return None, "Questions not list"
 
         normalized = []
         cmap = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4, "F": 5}
@@ -532,10 +542,7 @@ def download_single_test(test_id, fallback_name):
             try:
                 if not isinstance(item, dict):
                     continue
-                qc = item.get("json", {})
-                if not isinstance(qc, dict):
-                    qc = {}
-
+                qc = item.get("json", {}) or {}
                 qu = qc.get("_qu", {})
                 if isinstance(qu, dict):
                     qt = qu.get("_qu", "No Text")
@@ -571,7 +578,6 @@ def download_single_test(test_id, fallback_name):
                 rat = so.get("_ti", "No details") if isinstance(so, dict) else (so if isinstance(so, str) else "No details")
                 rat = embed_question_images(so if isinstance(so, dict) else {}, str(rat))
 
-                # Embed images in options
                 if isinstance(op, dict):
                     opts = [embed_question_images(op.get(k, {}) if isinstance(op.get(k), dict) else {}, x)
                             for k, x in zip(keys, opts)]
@@ -581,16 +587,13 @@ def download_single_test(test_id, fallback_name):
 
                 normalized.append({"text": qt, "options": opts, "correct_index": ci, "solution": rat})
             except Exception as e:
-                print(f"[WARN] Q parse: {e}")
-                continue
+                print(f"[WARN] Q: {e}")
 
         if not normalized:
-            return None, "No questions parsed"
+            return None, "Parse fail"
 
         clean = "".join([c if c.isalnum() or c in "._- " else "_" for c in test_name]) + "_@krrish_bro.html"
         fpath = os.path.join(DATA_DIR, clean)
-
-        # Duration default
         dur = 90 * 60
 
         html = CLASSPLUS_HTML_TEMPLATE.substitute(
@@ -609,9 +612,6 @@ def download_single_test(test_id, fallback_name):
 
         return fpath, f"OK ({len(normalized)} Qs)"
     except Exception as e:
-        import traceback
-        print(f"[FATAL] download: {e}")
-        traceback.print_exc()
         return None, f"{type(e).__name__}: {e}"
 
 
@@ -636,7 +636,7 @@ def build_caption(tid, tname):
 
 
 def send_test(chat_id, tid, tname):
-    fpath, status = download_single_test(tid, tname)
+    fpath, status = download_single_test(tid, tname, chat_id=chat_id)
     if not fpath or not os.path.exists(fpath):
         return False, status
     try:
@@ -661,39 +661,137 @@ def send_test(chat_id, tid, tname):
 
 
 # ============================================================
-# TELEGRAM HANDLERS
+# LOGIN SYSTEM
+# ============================================================
+def try_login_tnc(username, password):
+    patterns = [
+        {"fn": "common_fn", "se": "login", "data": {"json": "*"}, "user": username, "pass": password},
+        {"fn": "common_fn", "se": "lg", "data": {"json": "*"}, "user": username, "pass": password},
+        {"fn": "common_fn", "se": "signin", "data": {"json": "*"}, "user": username, "pass": password},
+        {"fn": "common_fn", "se": "login", "data": {"json": "*"}, "email": username, "password": password},
+        {"fn": "common_fn", "se": "login", "data": {"json": "*"}, "mobile": username, "password": password},
+    ]
+    for i, payload in enumerate(patterns):
+        try:
+            r = HTTP_SESSION.post(URL, headers=build_headers(), data={"payload": json.dumps(payload)}, timeout=20)
+            print(f"[LOGIN {i}] HTTP {r.status_code}: {r.text[:200]}")
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            if isinstance(data, list) and data:
+                data = data[0]
+            if isinstance(data, dict):
+                tok_fields = ["user", "uid", "user_id", "userId", "token", "auth", "session", "label", "_us", "_uid", "id"]
+                found = {}
+                for f in tok_fields:
+                    if f in data:
+                        found[f] = data[f]
+                    if "json" in data and isinstance(data["json"], dict):
+                        for f in tok_fields:
+                            if f in data["json"]:
+                                found[f] = data["json"][f]
+                if found and any(k in found for k in ("user", "uid", "user_id", "token", "auth")):
+                    return True, found, ""
+                for ef in ("error", "message", "msg", "err"):
+                    if ef in data:
+                        return False, None, str(data[ef])
+        except Exception as e:
+            print(f"[LOGIN ERR {i}] {e}")
+            continue
+    return False, None, "Login API endpoint unknown"
+
+
+@bot.message_handler(commands=['login'])
+def cmd_login(message):
+    chat_id = message.chat.id
+    user_states[chat_id] = "awaiting_id"
+    bot.reply_to(message,
+        "🔐 **TNC Login**\n\n"
+        "Apni TNC ID bhejo (mobile/username).\n\n❌ /cancel",
+        parse_mode="Markdown")
+
+
+@bot.message_handler(commands=['cancel'])
+def cmd_cancel(message):
+    user_states[message.chat.id] = None
+    bot.reply_to(message, "❌ Cancelled.")
+
+
+@bot.message_handler(commands=['logout'])
+def cmd_logout(message):
+    chat_id = message.chat.id
+    if str(chat_id) in USER_SESSIONS:
+        del USER_SESSIONS[str(chat_id)]
+        save_sessions(USER_SESSIONS)
+    user_states[chat_id] = None
+    bot.reply_to(message, "✅ Logout ho gaya.")
+
+
+@bot.message_handler(commands=['whoami'])
+def cmd_whoami(message):
+    s = USER_SESSIONS.get(str(message.chat.id))
+    if not s:
+        bot.reply_to(message, "❌ `/login` chalao.", parse_mode="Markdown")
+        return
+    bot.reply_to(message,
+        f"👤 User: `{s.get('user', '?')}`\n"
+        f"Since: {s.get('logged_in_at', '?')}",
+        parse_mode="Markdown")
+
+
+# ============================================================
+# COMMANDS
 # ============================================================
 @bot.message_handler(commands=['debug'])
 def cmd_debug(message):
-    lines = ["🔍 **API Debug**\n"]
-    lines.append(f"Working strategy: `{WORKING_STRATEGY['name'] if WORKING_STRATEGY else 'NONE'}`\n")
-    if WORKING_STRATEGY:
-        lines.append(f"User: `{WORKING_STRATEGY.get('user')}`")
-        lines.append(f"Label: `{WORKING_STRATEGY.get('label')}`")
-        lines.append(f"UA: `{WORKING_STRATEGY.get('ua')}`\n")
+    lines = ["🔍 **Debug**\n"]
+    lines.append(f"Strategy: `{WORKING_STRATEGY['name'] if WORKING_STRATEGY else 'NONE'}`")
     lines.append(f"Tests cached: {len(all_tests_cache)}")
+    sess = USER_SESSIONS.get(str(message.chat.id))
+    if sess:
+        lines.append(f"Logged in as: `{sess.get('user')}`")
+    else:
+        lines.append("Login: ❌ Not logged in")
     bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
 
 
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(message):
     global all_tests_cache
-    if WORKING_STRATEGY is None:
-        bot.reply_to(message, "⏳ Discover karta hoon API...")
-        discover_working_strategy()
-    if WORKING_STRATEGY is None:
-        bot.send_message(message.chat.id,
-            "❌ **API Unreachable**\n\nTNC ne API change kar diya hai. `/debug` chalao.",
+    chat_id = message.chat.id
+
+    sess = USER_SESSIONS.get(str(chat_id))
+    if not sess:
+        bot.send_message(chat_id,
+            "🤖 **Welcome!**\n\n"
+            "Pehle login karo:\n👉 `/login`\n\n"
+            "Phir `/start` chalao tests dekhne ke liye.",
             parse_mode="Markdown")
         return
+
+    if WORKING_STRATEGY is None:
+        bot.reply_to(message, "⏳ Loading API...")
+        discover_working_strategy()
+
     bot.reply_to(message, "⏳ Loading tests...")
-    all_tests_cache = get_all_test_ids()
+    all_tests_cache = get_all_test_ids(chat_id=chat_id)
+
     if not all_tests_cache:
-        bot.send_message(message.chat.id, "❌ 0 tests. `/debug` chalao.", parse_mode="Markdown")
+        bot.send_message(chat_id,
+            "❌ 0 tests mile. /debug chalao ya /logout karke dobara /login karo.",
+            parse_mode="Markdown")
         return
-    bot.send_message(message.chat.id,
-        f"🤖 **Bot Ready!**\n\nTotal: **{len(all_tests_cache)} Tests**\n\n"
-        f"Commands:\n/start /debug /download <no> /downloadall /categories",
+
+    bot.send_message(chat_id,
+        f"🤖 **Bot Ready!**\n\n"
+        f"User: `{sess.get('user')}`\n"
+        f"Total: **{len(all_tests_cache)} Tests**\n\n"
+        f"**Commands:**\n"
+        f"/download <no> — Test download\n"
+        f"/downloadall — Sab download\n"
+        f"/categories — Category list\n"
+        f"/debug — Status\n"
+        f"/logout — Logout",
         parse_mode="Markdown")
 
 
@@ -701,7 +799,7 @@ def cmd_start(message):
 def cmd_cats(message):
     global all_tests_cache
     if not all_tests_cache:
-        all_tests_cache = get_all_test_ids()
+        all_tests_cache = get_all_test_ids(chat_id=message.chat.id)
     if not all_tests_cache:
         bot.send_message(message.chat.id, "❌ No tests.")
         return
@@ -718,14 +816,13 @@ def cmd_cats(message):
 @bot.message_handler(commands=['downloadall'])
 def cmd_all(message):
     global all_tests_cache
-    all_tests_cache = get_all_test_ids()
+    all_tests_cache = get_all_test_ids(chat_id=message.chat.id)
     if not all_tests_cache:
         bot.send_message(message.chat.id, "❌ No tests.")
         return
     total = len(all_tests_cache)
     bot.send_message(message.chat.id, f"📦 Downloading {total} tests...")
-    ok = 0
-    fail = 0
+    ok = fail = 0
     for i, (tid, name) in enumerate(all_tests_cache, 1):
         bot.send_message(message.chat.id, f"📥 [{i}/{total}] {name}")
         s, st = send_test(message.chat.id, tid, name)
@@ -741,7 +838,7 @@ def cmd_all(message):
 def cmd_dl(message):
     global all_tests_cache
     if not all_tests_cache:
-        all_tests_cache = get_all_test_ids()
+        all_tests_cache = get_all_test_ids(chat_id=message.chat.id)
     if not all_tests_cache:
         bot.send_message(message.chat.id, "❌ No tests.")
         return
@@ -764,6 +861,64 @@ def cmd_dl(message):
 
 
 # ============================================================
+# LOGIN STATE HANDLER (BOTTOM)
+# ============================================================
+@bot.message_handler(
+    func=lambda m: user_states.get(m.chat.id) is not None
+                   and m.text is not None
+                   and not m.text.startswith('/'),
+    content_types=['text'])
+def handle_login_input(message):
+    chat_id = message.chat.id
+    state = user_states.get(chat_id)
+    text = message.text.strip()
+
+    if state == "awaiting_id":
+        user_states[chat_id] = {"step": "awaiting_pass", "user": text}
+        try:
+            bot.delete_message(chat_id, message.message_id)
+        except Exception:
+            pass
+        bot.send_message(chat_id, "✅ ID mila.\n\n🔑 Ab **Password** bhejo.", parse_mode="Markdown")
+        return
+
+    if isinstance(state, dict) and state.get("step") == "awaiting_pass":
+        username = state.get("user")
+        password = text
+        try:
+            bot.delete_message(chat_id, message.message_id)
+        except Exception:
+            pass
+
+        status = bot.send_message(chat_id, "⏳ Login karta hoon...")
+        ok, token, err = try_login_tnc(username, password)
+
+        if ok:
+            USER_SESSIONS[str(chat_id)] = {
+                "user": token.get("user") or token.get("uid") or token.get("user_id") or username,
+                "label": token.get("label") or "",
+                "raw": token,
+                "logged_in_at": now_ist().isoformat()
+            }
+            save_sessions(USER_SESSIONS)
+            user_states[chat_id] = None
+            try:
+                bot.edit_message_text(
+                    f"✅ **Login successful!**\n\nUser: `{USER_SESSIONS[str(chat_id)]['user']}`\n\nAb `/start` chalao.",
+                    chat_id, status.message_id, parse_mode="Markdown")
+            except Exception:
+                bot.send_message(chat_id, "✅ Login successful! /start chalao.")
+        else:
+            user_states[chat_id] = None
+            try:
+                bot.edit_message_text(
+                    f"❌ **Login failed**\n\n`{err}`\n\nDobara: `/login`",
+                    chat_id, status.message_id, parse_mode="Markdown")
+            except Exception:
+                bot.send_message(chat_id, f"❌ Login failed: {err}")
+
+
+# ============================================================
 # MAIN
 # ============================================================
 if __name__ == "__main__":
@@ -773,15 +928,13 @@ if __name__ == "__main__":
     print(f"[📁] DATA_DIR: {DATA_DIR}")
     print("=" * 60)
 
-    # Webhook delete karo (409 fix)
     try:
         bot.delete_webhook(drop_pending_updates=True)
         print("[✅] Webhook deleted")
     except Exception as e:
         print(f"[⚠️] Webhook: {e}")
 
-    # API auto-discover
     discover_working_strategy()
 
-    print("[💡] Telegram pe /start bhejo")
+    print("[💡] Telegram pe /login bhejo")
     bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
