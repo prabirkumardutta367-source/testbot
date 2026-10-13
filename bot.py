@@ -25,6 +25,9 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "8983424094:AAGJEzc1V7sPUNQuM8EJwShDJugt
 if not BOT_TOKEN:
     raise SystemExit("❌ BOT_TOKEN set nahi hai!")
 
+# TNC ka session token (HTTP Toolkit se nikala)
+TNC_TOKEN = "f027ce2f781cb9b3cbe92c6928149cb6"
+
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 try:
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -67,14 +70,17 @@ def now_ist():
 # ============================================================
 # HEADERS + PAYLOAD
 # ============================================================
-def build_headers(ua="Dart/3.7 (dart:io)"):
-    return {
+def build_headers(ua="Dart/3.7 (dart:io)", extra=None):
+    h = {
         "user-agent": ua,
         "content-type": "application/x-www-form-urlencoded",
         "accept": "application/json",
         "accept-encoding": "gzip",
         "host": "crm.tncnursing.in"
     }
+    if extra:
+        h.update(extra)
+    return h
 
 
 def build_payload(user=None, label=None, se="fl", sch="t_la", cond=None, extra=None):
@@ -100,77 +106,70 @@ TEST_CATEGORY_CACHE = {}
 IMAGE_DATA_CACHE = {}
 WORKING_STRATEGY = None
 WORKING_HEADERS = None
+WORKING_EXTRA_PAYLOAD = {}
 
 # ============================================================
-# USER SESSIONS (Login System)
-# ============================================================
-USER_SESSIONS_FILE = os.path.join(DATA_DIR, "user_sessions.json")
-user_states = {}
-
-
-def load_sessions():
-    try:
-        if os.path.exists(USER_SESSIONS_FILE):
-            with open(USER_SESSIONS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
-
-
-def save_sessions(sessions):
-    try:
-        with open(USER_SESSIONS_FILE, "w", encoding="utf-8") as f:
-            json.dump(sessions, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-
-USER_SESSIONS = load_sessions()
-
-
-# ============================================================
-# AUTO-DISCOVERY
+# MULTI-STRATEGY DISCOVERY (Token ko 9 tarikon se try karega)
 # ============================================================
 STRATEGIES = [
-    ("Dart3.7+old", "Dart/3.7 (dart:io)", "MhiG6fJRQO5ASHKSBYRh8U0JhqC4y9", "1624097755607_BCKL"),
-    ("Dart3.9+old", "Dart/3.9 (dart:io)", "MhiG6fJRQO5ASHKSBYRh8U0JhqC4y9", "1624097755607_BCKL"),
-    ("Dart3.10+old", "Dart/3.10 (dart:io)", "MhiG6fJRQO5ASHKSBYRh8U0JhqC4y9", "1624097755607_BCKL"),
-    ("Dart3.7+none", "Dart/3.7 (dart:io)", None, None),
-    ("Dart3.9+none", "Dart/3.9 (dart:io)", None, None),
+    ("token-as-user+Dart3.7", "Dart/3.7 (dart:io)", TNC_TOKEN, "", {}, {}),
+    ("token-as-user+Dart3.9", "Dart/3.9 (dart:io)", TNC_TOKEN, "", {}, {}),
+    ("token-as-user+Dart3.10", "Dart/3.10 (dart:io)", TNC_TOKEN, "", {}, {}),
+    ("token-as-label+Dart3.7", "Dart/3.7 (dart:io)", "MhiG6fJRQO5ASHKSBYRh8U0JhqC4y9", TNC_TOKEN, {}, {}),
+    ("token-both+old", "Dart/3.7 (dart:io)", TNC_TOKEN, "1624097755607_BCKL", {}, {}),
+    ("token-as-auth-header", "Dart/3.7 (dart:io)", None, None,
+     {"authorization": f"Bearer {TNC_TOKEN}"}, {}),
+    ("token-as-token-header", "Dart/3.7 (dart:io)", None, None,
+     {"x-auth-token": TNC_TOKEN}, {}),
+    ("token-in-payload", "Dart/3.7 (dart:io)", None, None, {},
+     {"token": TNC_TOKEN}),
+    ("token-as-auth-payload", "Dart/3.7 (dart:io)", None, None, {},
+     {"auth": TNC_TOKEN}),
+    ("token-as-session", "Dart/3.7 (dart:io)", None, None, {},
+     {"session": TNC_TOKEN}),
+    ("token-as-user_id", "Dart/3.7 (dart:io)", None, None, {},
+     {"user_id": TNC_TOKEN}),
+    ("token-as-uid", "Dart/3.7 (dart:io)", None, None, {},
+     {"uid": TNC_TOKEN}),
 ]
 
 
 def try_strategy(strat):
-    name, ua, user, label = strat
+    name, ua, user, label, extra_h, extra_p = strat
     try:
-        h = build_headers(ua)
+        h = build_headers(ua, extra_h)
         payload = build_payload(user=user, label=label)
+        payload.update(extra_p)
         r = HTTP_SESSION.post(URL, headers=h, data={"payload": json.dumps(payload)}, timeout=20)
-        print(f"[TRY] {name}: HTTP {r.status_code} | {r.text[:80]}")
+        print(f"[TRY] {name}: HTTP {r.status_code} | {r.text[:120]}")
         if r.status_code == 200:
-            data = r.json()
-            if (isinstance(data, list) and data) or (isinstance(data, dict) and data):
-                return True, h, user, label
-        return False, None, None, None
+            try:
+                data = r.json()
+                if (isinstance(data, list) and data) or (isinstance(data, dict) and data):
+                    return True, h, user, label, extra_p
+            except Exception:
+                pass
+        return False, None, None, None, None
     except Exception as e:
         print(f"[TRY] {name}: FAIL {e}")
-        return False, None, None, None
+        return False, None, None, None, None
 
 
 def discover_working_strategy():
-    global WORKING_STRATEGY, WORKING_HEADERS
+    global WORKING_STRATEGY, WORKING_HEADERS, WORKING_EXTRA_PAYLOAD
     print("=" * 60)
-    print("[🔎] Discovering API strategy...")
+    print("[🔎] Discovering API strategy with TNC token...")
+    print(f"[🔑] Token: {TNC_TOKEN[:8]}...{TNC_TOKEN[-4:]}")
     for s in STRATEGIES:
-        ok, h, u, l = try_strategy(s)
+        ok, h, u, l, ep = try_strategy(s)
         if ok:
             WORKING_STRATEGY = {"name": s[0], "user": u, "label": l, "ua": s[1]}
             WORKING_HEADERS = h
-            print(f"✅ Strategy: {s[0]}")
+            WORKING_EXTRA_PAYLOAD = ep or {}
+            print(f"✅ Working Strategy: {s[0]}")
             print("=" * 60)
             return True
-    print("⚠️ No global strategy — login system use karega")
+    print("⚠️ Koi strategy kaam nahi kar rahi — 401 abhi bhi")
     print("=" * 60)
     return False
 
@@ -180,6 +179,13 @@ def safe_post(endpoint, data, timeout=(30, 180)):
     r = HTTP_SESSION.post(endpoint, headers=h, data=data, timeout=timeout)
     r.raise_for_status()
     return r
+
+
+def get_effective_user_label():
+    """Return (user, label) based on working strategy."""
+    if WORKING_STRATEGY:
+        return WORKING_STRATEGY.get("user"), WORKING_STRATEGY.get("label")
+    return TNC_TOKEN, ""
 
 
 # ============================================================
@@ -413,24 +419,16 @@ def get_test_category(test_id):
 # ============================================================
 # GET ALL TESTS
 # ============================================================
-def get_all_test_ids(chat_id=None):
+def get_all_test_ids():
     global TEST_CATEGORY_CACHE
 
-    user = label = None
-    if chat_id:
-        sess = USER_SESSIONS.get(str(chat_id))
-        if sess:
-            user = sess.get("user")
-            label = sess.get("label", "")
-
-    if not user and WORKING_STRATEGY:
-        user = WORKING_STRATEGY.get("user")
-        label = WORKING_STRATEGY.get("label")
-
+    user, label = get_effective_user_label()
     if not user:
         return []
 
     payload = build_payload(user=user, label=label)
+    payload.update(WORKING_EXTRA_PAYLOAD)
+
     try:
         res = safe_post(URL, data={"payload": json.dumps(payload)}, timeout=(30, 180))
         master = res.json()
@@ -483,19 +481,10 @@ def get_all_test_ids(chat_id=None):
 # ============================================================
 # DOWNLOAD SINGLE TEST
 # ============================================================
-def download_single_test(test_id, fallback_name, chat_id=None):
-    user = label = None
-    if chat_id:
-        sess = USER_SESSIONS.get(str(chat_id))
-        if sess:
-            user = sess.get("user")
-            label = sess.get("label", "")
-    if not user and WORKING_STRATEGY:
-        user = WORKING_STRATEGY.get("user")
-        label = WORKING_STRATEGY.get("label")
-
+def download_single_test(test_id, fallback_name):
+    user, label = get_effective_user_label()
     if not user:
-        return None, "Login required. /login chalao."
+        return None, "No token"
 
     payload = build_payload(
         user=user, label=label,
@@ -503,6 +492,8 @@ def download_single_test(test_id, fallback_name, chat_id=None):
         cond=[test_id],
         extra={"freeExams": [test_id], "paidExams": []}
     )
+    payload.update(WORKING_EXTRA_PAYLOAD)
+
     try:
         res = safe_post(URL, data={"payload": json.dumps(payload)}, timeout=(30, 180))
         resp = res.json()
@@ -530,6 +521,8 @@ def download_single_test(test_id, fallback_name, chat_id=None):
             user=user, label=label, se="fe", sch="t_qu",
             cond={"(row_id)": q_ids}
         )
+        q_payload.update(WORKING_EXTRA_PAYLOAD)
+
         r_q = safe_post(URL, data={"payload": json.dumps(q_payload)}, timeout=(30, 180))
         raw_q = r_q.json()
         if not isinstance(raw_q, list):
@@ -636,7 +629,7 @@ def build_caption(tid, tname):
 
 
 def send_test(chat_id, tid, tname):
-    fpath, status = download_single_test(tid, tname, chat_id=chat_id)
+    fpath, status = download_single_test(tid, tname)
     if not fpath or not os.path.exists(fpath):
         return False, status
     try:
@@ -661,182 +654,44 @@ def send_test(chat_id, tid, tname):
 
 
 # ============================================================
-# LOGIN
-# ============================================================
-def try_login_tnc(username, password):
-    patterns = [
-        {"fn": "common_fn", "se": "login", "data": {"json": "*"}, "user": username, "pass": password},
-        {"fn": "common_fn", "se": "lg", "data": {"json": "*"}, "user": username, "pass": password},
-        {"fn": "common_fn", "se": "signin", "data": {"json": "*"}, "user": username, "pass": password},
-        {"fn": "common_fn", "se": "auth", "data": {"json": "*"}, "user": username, "pass": password},
-        {"fn": "common_fn", "se": "login", "data": {"json": "*"}, "mobile": username, "password": password},
-        {"fn": "common_fn", "se": "login", "data": {"json": "*"}, "email": username, "password": password},
-        {"fn": "login", "data": {"json": "*"}, "user": username, "pass": password},
-        {"fn": "auth", "se": "login", "data": {"json": "*"}, "user": username, "pass": password},
-    ]
-    last_err = "No endpoint responded"
-    for i, payload in enumerate(patterns):
-        try:
-            r = HTTP_SESSION.post(URL, headers=build_headers(), data={"payload": json.dumps(payload)}, timeout=20)
-            print(f"[LOGIN {i}] HTTP {r.status_code}: {r.text[:200]}")
-            if r.status_code != 200:
-                last_err = f"HTTP {r.status_code}"
-                continue
-            try:
-                data = r.json()
-            except Exception:
-                continue
-            if isinstance(data, list) and data:
-                data = data[0]
-            if isinstance(data, dict):
-                tok_fields = ["user", "uid", "user_id", "userId", "token", "auth", "session", "label", "_us", "_uid", "id"]
-                found = {}
-                for f in tok_fields:
-                    if f in data:
-                        found[f] = data[f]
-                    if "json" in data and isinstance(data["json"], dict):
-                        for f in tok_fields:
-                            if f in data["json"]:
-                                found[f] = data["json"][f]
-                if found and any(k in found for k in ("user", "uid", "user_id", "token", "auth")):
-                    return True, found, ""
-                for ef in ("error", "message", "msg", "err"):
-                    if ef in data:
-                        last_err = str(data[ef])
-        except Exception as e:
-            print(f"[LOGIN ERR {i}] {e}")
-            last_err = str(e)
-            continue
-    return False, None, last_err
-
-
-@bot.message_handler(commands=['login'])
-def cmd_login(message):
-    chat_id = message.chat.id
-    user_states[chat_id] = "awaiting_id"
-    bot.reply_to(message,
-        "🔐 **TNC Login**\n\n"
-        "Apni TNC ID bhejo (mobile/username).\n\n❌ /cancel",
-        parse_mode="Markdown")
-
-
-@bot.message_handler(commands=['cancel'])
-def cmd_cancel(message):
-    user_states[message.chat.id] = None
-    bot.reply_to(message, "❌ Cancelled.")
-
-
-@bot.message_handler(commands=['logout'])
-def cmd_logout(message):
-    chat_id = message.chat.id
-    if str(chat_id) in USER_SESSIONS:
-        del USER_SESSIONS[str(chat_id)]
-        save_sessions(USER_SESSIONS)
-    user_states[chat_id] = None
-    bot.reply_to(message, "✅ Logout ho gaya.")
-
-
-@bot.message_handler(commands=['whoami'])
-def cmd_whoami(message):
-    s = USER_SESSIONS.get(str(message.chat.id))
-    if not s:
-        bot.reply_to(message, "❌ `/login` chalao.", parse_mode="Markdown")
-        return
-    bot.reply_to(message,
-        f"👤 User: `{s.get('user', '?')}`\n"
-        f"Since: {s.get('logged_in_at', '?')}",
-        parse_mode="Markdown")
-
-
-# ============================================================
-# DEBUG + FINDLOGIN
+# TELEGRAM COMMANDS
 # ============================================================
 @bot.message_handler(commands=['debug'])
 def cmd_debug(message):
     lines = ["🔍 **Debug**\n"]
     lines.append(f"Strategy: `{WORKING_STRATEGY['name'] if WORKING_STRATEGY else 'NONE'}`")
+    lines.append(f"Token: `{TNC_TOKEN[:8]}...{TNC_TOKEN[-4:]}`")
     lines.append(f"Tests cached: {len(all_tests_cache)}")
-    sess = USER_SESSIONS.get(str(message.chat.id))
-    if sess:
-        lines.append(f"Logged: ✅ `{sess.get('user')}`")
-    else:
-        lines.append("Logged: ❌")
     bot.reply_to(message, "\n".join(lines), parse_mode="Markdown")
 
 
-@bot.message_handler(commands=['findlogin'])
-def cmd_findlogin(message):
-    """Login endpoint discovery — multiple patterns."""
-    results = ["🔍 **Login Discovery**\n"]
-    patterns = [
-        ("common_fn", "login", {"user": "test", "pass": "test"}),
-        ("common_fn", "lg", {"user": "test", "pass": "test"}),
-        ("common_fn", "signin", {"user": "test", "pass": "test"}),
-        ("common_fn", "auth", {"user": "test", "pass": "test"}),
-        ("common_fn", "login", {"mobile": "test", "password": "test"}),
-        ("common_fn", "login", {"email": "test", "password": "test"}),
-        ("login", "", {"user": "test", "pass": "test"}),
-        ("auth", "login", {"user": "test", "pass": "test"}),
-        ("user", "login", {"user": "test", "pass": "test"}),
-        ("common_fn", "lgn", {"user": "test", "pass": "test"}),
-        ("common_fn", "sign_in", {"user": "test", "pass": "test"}),
-    ]
-    for fn, se, extra in patterns:
-        try:
-            p = {"fn": fn, "data": {"json": "*"}}
-            if se:
-                p["se"] = se
-            p.update(extra)
-            r = HTTP_SESSION.post(URL, headers=build_headers(), data={"payload": json.dumps(p)}, timeout=15)
-            body = r.text[:120].replace("\n", " ")
-            results.append(f"`{fn}/{se}` → {r.status_code}\n`{body}`\n")
-        except Exception as e:
-            results.append(f"`{fn}/{se}` → ERR {type(e).__name__}\n")
-
-    msg = "\n".join(results)
-    for i in range(0, len(msg), 3500):
-        try:
-            bot.send_message(message.chat.id, f"```\n{msg[i:i+3500]}\n```", parse_mode="Markdown")
-        except Exception:
-            bot.send_message(message.chat.id, msg[i:i+3500])
-
-
-# ============================================================
-# MAIN COMMANDS
-# ============================================================
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(message):
     global all_tests_cache
-    chat_id = message.chat.id
 
-    sess = USER_SESSIONS.get(str(chat_id))
-    if not sess:
-        bot.send_message(chat_id,
-            "🤖 **Welcome!**\n\n"
-            "Pehle login karo:\n👉 `/login`\n\n"
-            "Login endpoint pata nahi? `/findlogin` chalao.",
-            parse_mode="Markdown")
-        return
+    if WORKING_STRATEGY is None:
+        bot.reply_to(message, "⏳ Loading API...")
+        discover_working_strategy()
 
     bot.reply_to(message, "⏳ Loading tests...")
-    all_tests_cache = get_all_test_ids(chat_id=chat_id)
+    all_tests_cache = get_all_test_ids()
 
     if not all_tests_cache:
-        bot.send_message(chat_id,
-            "❌ 0 tests. `/debug` chalao ya `/logout` → `/login` dobara.",
+        bot.send_message(message.chat.id,
+            "❌ **0 tests found!**\n\n"
+            "Token kaam nahi kar raha. `/debug` chalao ya naya token lao.",
             parse_mode="Markdown")
         return
 
-    bot.send_message(chat_id,
+    bot.send_message(message.chat.id,
         f"🤖 **Bot Ready!**\n\n"
-        f"User: `{sess.get('user')}`\n"
+        f"Strategy: `{WORKING_STRATEGY['name'] if WORKING_STRATEGY else 'NONE'}`\n"
         f"Total: **{len(all_tests_cache)} Tests**\n\n"
         f"**Commands:**\n"
-        f"/download <no>\n"
-        f"/downloadall\n"
-        f"/categories\n"
-        f"/debug\n"
-        f"/logout",
+        f"/download <no> — Test download\n"
+        f"/downloadall — Sab download\n"
+        f"/categories — Category list\n"
+        f"/debug — Status",
         parse_mode="Markdown")
 
 
@@ -844,7 +699,7 @@ def cmd_start(message):
 def cmd_cats(message):
     global all_tests_cache
     if not all_tests_cache:
-        all_tests_cache = get_all_test_ids(chat_id=message.chat.id)
+        all_tests_cache = get_all_test_ids()
     if not all_tests_cache:
         bot.send_message(message.chat.id, "❌ No tests.")
         return
@@ -861,7 +716,7 @@ def cmd_cats(message):
 @bot.message_handler(commands=['downloadall'])
 def cmd_all(message):
     global all_tests_cache
-    all_tests_cache = get_all_test_ids(chat_id=message.chat.id)
+    all_tests_cache = get_all_test_ids()
     if not all_tests_cache:
         bot.send_message(message.chat.id, "❌ No tests.")
         return
@@ -883,7 +738,7 @@ def cmd_all(message):
 def cmd_dl(message):
     global all_tests_cache
     if not all_tests_cache:
-        all_tests_cache = get_all_test_ids(chat_id=message.chat.id)
+        all_tests_cache = get_all_test_ids()
     if not all_tests_cache:
         bot.send_message(message.chat.id, "❌ No tests.")
         return
@@ -906,70 +761,13 @@ def cmd_dl(message):
 
 
 # ============================================================
-# LOGIN STATE HANDLER (BOTTOM — MUST BE LAST)
-# ============================================================
-@bot.message_handler(
-    func=lambda m: user_states.get(m.chat.id) is not None
-                   and m.text is not None
-                   and not m.text.startswith('/'),
-    content_types=['text'])
-def handle_login_input(message):
-    chat_id = message.chat.id
-    state = user_states.get(chat_id)
-    text = message.text.strip()
-
-    if state == "awaiting_id":
-        user_states[chat_id] = {"step": "awaiting_pass", "user": text}
-        try:
-            bot.delete_message(chat_id, message.message_id)
-        except Exception:
-            pass
-        bot.send_message(chat_id, "✅ ID mila.\n\n🔑 Ab **Password** bhejo.", parse_mode="Markdown")
-        return
-
-    if isinstance(state, dict) and state.get("step") == "awaiting_pass":
-        username = state.get("user")
-        password = text
-        try:
-            bot.delete_message(chat_id, message.message_id)
-        except Exception:
-            pass
-
-        status = bot.send_message(chat_id, "⏳ Login karta hoon...")
-        ok, token, err = try_login_tnc(username, password)
-
-        if ok:
-            USER_SESSIONS[str(chat_id)] = {
-                "user": token.get("user") or token.get("uid") or token.get("user_id") or username,
-                "label": token.get("label") or "",
-                "raw": token,
-                "logged_in_at": now_ist().isoformat()
-            }
-            save_sessions(USER_SESSIONS)
-            user_states[chat_id] = None
-            try:
-                bot.edit_message_text(
-                    f"✅ **Login successful!**\n\nUser: `{USER_SESSIONS[str(chat_id)]['user']}`\n\nAb `/start` chalao.",
-                    chat_id, status.message_id, parse_mode="Markdown")
-            except Exception:
-                bot.send_message(chat_id, "✅ Login successful! /start chalao.")
-        else:
-            user_states[chat_id] = None
-            try:
-                bot.edit_message_text(
-                    f"❌ **Login failed**\n\n`{err}`\n\nDobara: `/login`",
-                    chat_id, status.message_id, parse_mode="Markdown")
-            except Exception:
-                bot.send_message(chat_id, f"❌ Login failed: {err}")
-
-
-# ============================================================
 # MAIN
 # ============================================================
 if __name__ == "__main__":
     print("=" * 60)
     print("[🚀] Bot starting...")
-    print(f"[🔑] Token: {'YES' if BOT_TOKEN else 'NO'}")
+    print(f"[🔑] Bot token: {'YES' if BOT_TOKEN else 'NO'}")
+    print(f"[🔑] TNC token: {TNC_TOKEN[:8]}...{TNC_TOKEN[-4:]}")
     print(f"[📁] DATA_DIR: {DATA_DIR}")
     print("=" * 60)
 
@@ -984,7 +782,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[⚠️] Discovery failed: {e}")
 
-    print("[💡] Telegram pe /login ya /findlogin bhejo")
+    print("[💡] Telegram pe /start bhejo")
 
     while True:
         try:
